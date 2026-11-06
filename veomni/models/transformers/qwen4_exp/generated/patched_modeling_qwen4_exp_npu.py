@@ -1040,6 +1040,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
+        self.qsa_indexer_implementation = getattr(config.ops_config, "qsa_indexer_implementation", "eager")
 
     def forward(
         self,
@@ -1054,6 +1055,19 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         # --- Patch.1: Select compact global QSA token indices for local queries under Ulysses/CP. ---
         # Using sequence-local RoPE inputs and gathering only the compressed keys
         # across the sequence-parallel group while returning local query selections.
+        if getattr(self, "qsa_indexer_implementation", "eager") == "npu_ascendc":
+            from veomni.ops.kernels.qsa.ascendc.qsa_indexer import qwen4_exp_qsa_indexer_forward_lightning
+
+            return qwen4_exp_qsa_indexer_forward_lightning(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                cu_seq_lens_q=cu_seq_lens_q,
+                packed_seq_lens=packed_seq_lens,
+                qsa_metadata=qsa_metadata,
+            )
         del attention_mask
         parallel_state = get_parallel_state()
         if past_key_values is not None:
