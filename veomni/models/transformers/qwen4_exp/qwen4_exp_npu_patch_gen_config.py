@@ -48,34 +48,38 @@ else:
 # Replace the GPU QSA indexer mask value in-place so NPU masks invisible block
 # scores with -1.0 instead of -inf. ReLU block scores are non-negative, and
 # CANN TopKV2 faults (AICore error 507015) on sparse rows dominated by -inf.
-# Then dispatch the CANN Lightning Indexer (TND varlen, cann_ops_transformer)
-# at the top of the forward: qsa_indexer_implementation == "npu_ascendc" routes
-# the whole call to veomni.ops.kernels.qsa.ascendc.qsa_indexer, a standalone
-# drop-in that reproduces the eager selection for the flat packed layout
-# without Ulysses/CP (those raise there). The eager loop below — including
-# the block_starts.numel() chunked einsum+ReLU+topk selection — stays
-# byte-identical as the reference path.
+# Then arm the eager TopK branch with a CANN Lightning Indexer leg:
+# qsa_indexer_implementation == "npu_ascendc" hands the rotated q and pooled
+# keys — already produced by the eager projection/RoPE/pooling chain shared
+# by both implementations — to
+# veomni.ops.kernels.qsa.ascendc.qsa_indexer, which returns the block-lane
+# token columns the eager loop builds as selected_local PRE-tail; eager's own
+# tail/concat/pad/truncation then finishes the row for both paths. Batches
+# with no complete block ride the eager else branch entirely (the elif
+# re-arms the original loop body verbatim at its original indentation).
 for _patch in config.patches:
     if _patch.target == "Qwen4ExpTextQSAIndexer.forward":
         _patch.name_map = {
             'scores = scores.masked_fill(~visible, float("-inf"))': (
                 "scores = scores.masked_fill(~visible, -1.0)  # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0)"
             ),
-            "del attention_mask": (
-                "if getattr(self, \"qsa_indexer_implementation\", \"eager\") == \"npu_ascendc\":\n"
-                "            from veomni.ops.kernels.qsa.ascendc.qsa_indexer import "
-                "qwen4_exp_qsa_indexer_forward_lightning\n\n"
-                "            return qwen4_exp_qsa_indexer_forward_lightning(\n"
+            "if block_starts.numel():": (
+                "if getattr(self, \"qsa_indexer_implementation\", \"eager\") == \"npu_ascendc\" and block_starts.numel():\n"
+                "            # Patch.1 (inline dispatch): the CANN Lightning Indexer replaces only\n"
+                "            # the TopK block selection; the tail/concat/pad/truncation below and\n"
+                "            # the projection/RoPE/pooling chain above are the eager code shared\n"
+                "            # by both implementations. Batches with no complete block ride the\n"
+                "            # eager else branch for both paths.\n"
+                "            from veomni.ops.kernels.qsa.ascendc.qsa_indexer import qwen4_exp_qsa_indexer_forward_lightning\n"
+                "\n"
+                "            selected_local = qwen4_exp_qsa_indexer_forward_lightning(\n"
                 "                self,\n"
-                "                hidden_states,\n"
-                "                position_embeddings,\n"
-                "                attention_mask,\n"
-                "                past_key_values,\n"
+                "                q,\n"
+                "                pooled_keys,\n"
                 "                cu_seq_lens_q=cu_seq_lens_q,\n"
                 "                packed_seq_lens=packed_seq_lens,\n"
-                "                qsa_metadata=qsa_metadata,\n"
                 "            )\n"
-                "        del attention_mask"
+                "        elif block_starts.numel():"
             ),
         }
         break

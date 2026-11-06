@@ -42,6 +42,7 @@ that mode.
 from __future__ import annotations
 
 import importlib.util
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -158,9 +159,21 @@ def test_npu_ascendc_matches_eager(case):
     for seed in _SEEDS:
         case_id, indexer, hidden, positions, cu, packed = _build_case(case, device, seed)
         indexer.qsa_indexer_implementation = "eager"
+        torch.npu.synchronize()
+        _t_eager_start = time.perf_counter()
         eager = _forward(indexer, hidden, positions, cu, packed)
+        torch.npu.synchronize()
+        _t_eager = (time.perf_counter() - _t_eager_start) * 1e3
         indexer.qsa_indexer_implementation = "npu_ascendc"
+        torch.npu.synchronize()
+        _t_light_start = time.perf_counter()
         lightning = _forward(indexer, hidden, positions, cu, packed)
+        torch.npu.synchronize()
+        _t_lightning = (time.perf_counter() - _t_light_start) * 1e3
+        print(
+            f"[timing] {case_id} seed{seed}: eager {_t_eager:.3f} ms | npu_ascendc {_t_lightning:.3f} ms",
+            flush=True,
+        )
         _assert_same_selection(lightning, eager, f"npu_ascendc_vs_eager[{case_id}-seed{seed}]")
 
 
