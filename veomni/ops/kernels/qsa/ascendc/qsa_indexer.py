@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CANN pool_key_indexer backend for the Qwen4-Exp QSA block selection.
+"""CANN LightningIndexerV2 backend for the Qwen4-Exp QSA block selection.
 
 Inline dispatch from the generated modeling forward: this replaces only the
 eager TopK loop and returns its ``selected_local`` PRE-tail intermediate
 (``int32`` token columns, ``-1`` padding); the shared eager
-tail/concat/pad/truncation finishes the row for both implementations. The
-op's calling contract — alignment, tail lanes, dtypes — is documented at
-the call sites. MindSpeed-MM's integration pointed at the fused-op family.
+tail/concat/pad/truncation finishes the row for both implementations. The op
+consumes the already-pooled blocks directly — one TND varlen call per batch.
 """
 
 from __future__ import annotations
@@ -30,10 +29,9 @@ from torch import Tensor
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 if IS_NPU_AVAILABLE:
-    from cann_ops_transformer.ops import pool_key_indexer
+    from cann_ops_transformer.ops import lightning_indexer, lightning_indexer_metadata
 
 _WEIGHT_CACHE: dict[tuple, Tensor] = {}
-_TAIL_K_CACHE: dict[tuple, Tensor] = {}
 
 # Segment-causal floor rule: block j is visible to query row t iff
 # j * cr + cr - 1 <= t — the eager segment loop's rule, and what the
@@ -41,83 +39,116 @@ _TAIL_K_CACHE: dict[tuple, Tensor] = {}
 _SEGMENT_CAUSAL_MASK_MODE = 3
 
 
-@torch.no_grad()
-def qsa_poolkey_selected_token_ids(
+def qsa_lightning_selected_token_ids(
     index_queries: Tensor,
     pooled_keys: Tensor,
+    segment_lens: list[int] | tuple[int, ...],
     *,
     token_budget: int,
     compress_ratio: int,
     block_topk: int | None = None,
 ) -> Tensor:
-    """Eager-format TopK block expansion via pool_key_indexer.
+    """Eager-format TopK block expansion via LightningIndexerV2 (TND varlen).
 
     ``index_queries`` is ``[B, S, H, D]`` and ``pooled_keys`` is
     ``[B, blocks, D]`` — already normed and rotated by the shared modeling
-    chain. Returns exactly what the eager loop builds as ``selected_local``
-    BEFORE the tail concatenation: ``int32
-    [B, S, min(block_topk, blocks) * compress_ratio]`` per-batch LOCAL token
-    ids in score-ordered block lanes with ``-1`` padding. The shared modeling
-    code appends the tail lanes, pads, and truncates to ``output_width``.
+    chain, flattened here into one segment-major flat batch (segments = the
+    ``segment_lens`` entries, in query-row order). Returns the eager loop's
+    ``selected_local`` BEFORE the tail concatenation: ``int32
+    [B * S, min(block_topk, blocks) * compress_ratio]`` per-segment LOCAL
+    token ids in score-ordered block lanes with ``-1`` padding.
     """
     batch, query_length, query_heads, head_dim = index_queries.shape
-    key_blocks = pooled_keys.shape[1]
+    flat_keys = pooled_keys.reshape(-1, head_dim)
+    total_blocks = flat_keys.shape[0]
     if block_topk is None:  # indexer attribute; the two differ when budget % cr != 0
         block_topk = token_budget // compress_ratio
+    segment_block_counts = [length // compress_ratio for length in segment_lens]
     supported = (
         index_queries.device.type == "npu"
         and index_queries.dtype in (torch.float16, torch.bfloat16)
         and pooled_keys.dtype == index_queries.dtype
-        and pooled_keys.shape == (batch, key_blocks, head_dim)
+        and sum(segment_block_counts) == total_blocks
         and head_dim == 128
         and token_budget > 0
         and block_topk >= 1
     )
     if not supported:
-        raise RuntimeError("QSA shape is unsupported by the CANN pool_key_indexer")
+        raise RuntimeError("QSA shape is unsupported by the CANN lightning indexer")
 
+    total_tokens = batch * query_length
+    width = min(block_topk, total_blocks)
     device = index_queries.device
-    # Token-level topk mirrors eager's TopK width: the op selects
-    # topk // cr blocks and expands each into cr token lanes.
-    topk_tokens = min(block_topk, key_blocks) * compress_ratio
-    # Weights must share the query's dtype (fp32 is rejected); 1/sqrt(D)
-    # matches eager's ReLU-sum / sqrt(head_dim). Cached by shape, shared
-    # across per-layer indexer instances.
-    weights_key = (str(device), batch, query_length, query_heads, index_queries.dtype)
+    if width < 1:  # no complete block anywhere: the eager empty contract
+        return torch.empty((total_tokens, 0), dtype=torch.int32, device=device)
+    # One TND call covers every segment: the cu_seqlens boundaries carry the
+    # per-segment candidate sets and the segment-causal rule (mask_mode 3).
+    cu_q_host = [0]
+    cu_k_host = [0]
+    for length, count in zip(segment_lens, segment_block_counts):
+        cu_q_host.append(cu_q_host[-1] + length)
+        cu_k_host.append(cu_k_host[-1] + count)
+    cu_seq_lens_q = torch.tensor(cu_q_host, dtype=torch.int32, device=device)
+    cu_seq_lens_k = torch.tensor(cu_k_host, dtype=torch.int32, device=device)
+    # LightningIndexerV2 rejects cmp_residual_k when cmp_ratio is 1; the
+    # caller's all-zero entries are dropped for that case.
+    if compress_ratio > 1:
+        cmp_residual_k = torch.tensor(
+            [length % compress_ratio for length in segment_lens], dtype=torch.int32, device=device
+        )
+    else:
+        cmp_residual_k = None
+    # Uniform fp32 per-head weights: 1/sqrt(head_dim) reproduces the eager
+    # ReLU-sum score scaling. Cached by shape, shared across layers.
+    weights_key = (str(device), total_tokens, query_heads)
     weights = _WEIGHT_CACHE.get(weights_key)
     if weights is None:
-        weights = torch.full(
-            (batch, query_length, query_heads),
-            head_dim**-0.5,
-            dtype=pooled_keys.dtype,
-            device=device,
-        )
+        weights = torch.full((total_tokens, query_heads), head_dim**-0.5, dtype=torch.float32, device=device)
         _WEIGHT_CACHE[weights_key] = weights
-    # The honest residual pins the op's suffix alignment at zero shift:
-    # kv_span = key_blocks * cr + pool_tail_k must equal query_length, else
-    # every row shifts down by the difference.
-    residual = query_length % compress_ratio
-    tail_key = (str(device), batch, residual)
-    tail_k = _TAIL_K_CACHE.get(tail_key)
-    if tail_k is None:
-        tail_k = torch.full((batch,), residual, dtype=torch.int64, device=device)
-        _TAIL_K_CACHE[tail_key] = tail_k
-    indices, _ = pool_key_indexer(
-        index_queries.contiguous(),
-        pooled_keys.unsqueeze(2),
-        weights,
-        tail_k,
-        layout_q="BSND",
-        layout_k="BSND",
-        topk=topk_tokens,
-        pool_size=compress_ratio,
-        mask_mode=_SEGMENT_CAUSAL_MASK_MODE,
-        return_value=False,
-    )
-    # The op's tail lanes (columns [topk_tokens, topk_tokens + cr)) follow a
-    # different contract than eager's row-local tails — drop them; the
-    # shared modeling tail construction appends the real ones.
-    return indices[..., :topk_tokens]
+    with torch.no_grad():
+        # The TND plan encodes the per-segment task split, so it is rebuilt
+        # per call (the boundaries change with every batch).
+        metadata = lightning_indexer_metadata(
+            query_heads,
+            1,
+            head_dim,
+            width,
+            cu_seqlens_q=cu_seq_lens_q,
+            cu_seqlens_k=cu_seq_lens_k,
+            cmp_residual_k=cmp_residual_k,
+            batch_size=len(segment_lens),
+            max_seqlen_q=max(segment_lens),
+            max_seqlen_k=max(segment_block_counts),
+            layout_q="TND",
+            layout_k="TND",
+            mask_mode=_SEGMENT_CAUSAL_MASK_MODE,
+            cmp_ratio=compress_ratio,
+        )
+        indices, _ = lightning_indexer(
+            index_queries.to(torch.bfloat16).reshape(total_tokens, query_heads, head_dim).contiguous(),
+            flat_keys.to(torch.bfloat16).reshape(total_blocks, 1, head_dim).contiguous(),
+            weights,
+            width,
+            cu_seqlens_q=cu_seq_lens_q,
+            cu_seqlens_k=cu_seq_lens_k,
+            cmp_residual_k=cmp_residual_k,
+            metadata=metadata,
+            max_seqlen_q=-1,
+            layout_q="TND",
+            layout_k="TND",
+            mask_mode=_SEGMENT_CAUSAL_MASK_MODE,
+            cmp_ratio=compress_ratio,
+            return_value=0,
+        )
+    # The kernel returns per-segment block ids ([total_tokens, width]);
+    # expand each into its cr token lanes the way the eager loop does
+    # (block-major lanes, -1 padding survives).
+    indices = indices.reshape(total_tokens, width)
+    valid = indices >= 0
+    safe_ids = indices.clamp(min=0).to(torch.long)
+    block_offsets = torch.arange(compress_ratio, device=device)
+    lanes = safe_ids * compress_ratio + block_offsets
+    return lanes.masked_fill(~valid[..., None], -1).flatten(-2).to(torch.int32)
 
 
 def qwen4_exp_qsa_indexer_forward_lightning(
@@ -156,22 +187,24 @@ def qwen4_exp_qsa_indexer_forward_lightning(
         )
     if self.index_head_dim != 128:
         raise ValueError(
-            f"The CANN QSA indexer (pool_key_indexer) requires indexer_head_dim == 128; got {self.index_head_dim}. "
+            f"The CANN QSA indexer (LightningIndexerV2) requires indexer_head_dim == 128; got {self.index_head_dim}. "
             "Use qsa_indexer_implementation='eager' otherwise."
         )
 
     batch_size, local_seq_len = q.shape[0], q.shape[1]
 
     if cu_seq_lens_q is None:
-        # Equal-length batch: one BSND call over [B, S]. The op's ids are
-        # already per-batch local — exactly the eager unpacked contract.
-        return qsa_poolkey_selected_token_ids(
+        # Equal-length batch: one TND call over [B, S] as B segments. The
+        # per-segment ids are already per-batch local — the eager unpacked
+        # contract.
+        return qsa_lightning_selected_token_ids(
             q,
-            pooled_keys.view(batch_size, -1, self.index_head_dim),
+            pooled_keys,
+            [local_seq_len] * batch_size,
             token_budget=self.token_budget,
             compress_ratio=self.compress_ratio,
             block_topk=self.block_topk,
-        )
+        ).view(batch_size, local_seq_len, -1)
 
     # Packed flat batch [1, T]. Host-side segment lengths in flat order: the
     # packing collator gives packed_seq_lens; a bare cu_seq_lens_q works too
@@ -186,33 +219,23 @@ def qwen4_exp_qsa_indexer_forward_lightning(
             "Qwen4-Exp compact QSA CANN indexer needs segment lengths that cover the batch; "
             f"got {segment_lens} for batch_size={batch_size}, local_seq_len={local_seq_len}."
         )
-    seg_block_counts = [length // self.compress_ratio for length in segment_lens]
-    if sum(seg_block_counts) != pooled_keys.shape[1]:
-        raise ValueError(
-            "Qwen4-Exp compact QSA CANN indexer needs the flat block list to hold exactly "
-            f"the per-segment blocks; got {pooled_keys.shape[1]} blocks for segment lengths "
-            f"{segment_lens} with compress_ratio={self.compress_ratio}."
-        )
-    # One core call per segment on LOCAL rows (the op rejects actual_seq_q
-    # under BSND, so there is no native varlen): the honest per-segment
-    # pool_tail_k keeps the alignment exact. A segment's frame can be
-    # narrower than eager's flat-batch TopK width, so the output is
-    # pre-filled with -1 and each segment writes only its valid columns.
-    columns = min(self.block_topk, pooled_keys.shape[1]) * self.compress_ratio
-    out = torch.full((local_seq_len, columns), -1, dtype=torch.int32, device=q.device)
-    token_start = 0
-    block_start = 0
-    for length, seg_blocks in zip(segment_lens, seg_block_counts):
-        selected = qsa_poolkey_selected_token_ids(
-            q[0, token_start : token_start + length].unsqueeze(0),
-            pooled_keys[0, block_start : block_start + seg_blocks].unsqueeze(0),
-            token_budget=self.token_budget,
-            compress_ratio=self.compress_ratio,
-            block_topk=self.block_topk,
-        )[0]
-        # Local -> flat ids; -1 padding slots must survive the offset.
-        flat = torch.where(selected >= 0, selected + token_start, selected)
-        out[token_start : token_start + length, : selected.shape[-1]] = flat
-        token_start += length
-        block_start += seg_blocks
-    return out.view(1, local_seq_len, columns)
+    selected = qsa_lightning_selected_token_ids(
+        q,
+        pooled_keys,
+        segment_lens,
+        token_budget=self.token_budget,
+        compress_ratio=self.compress_ratio,
+        block_topk=self.block_topk,
+    )
+    # Per-segment LOCAL -> flat ids; -1 padding slots must survive the offset.
+    cu_q_host = [0]
+    for length in segment_lens:
+        cu_q_host.append(cu_q_host[-1] + length)
+    cu_seq_q = torch.tensor(cu_q_host, dtype=torch.int32, device=q.device)
+    total_tokens = batch_size * local_seq_len
+    token_segment = torch.searchsorted(
+        cu_seq_q, torch.arange(total_tokens, device=q.device, dtype=cu_seq_q.dtype), right=True
+    ) - 1
+    segment_starts = cu_seq_q[:-1].index_select(0, token_segment).view(total_tokens, 1)
+    selected = torch.where(selected >= 0, selected + segment_starts, selected)
+    return selected.view(1, local_seq_len, -1)
