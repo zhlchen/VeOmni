@@ -1539,6 +1539,13 @@ class OpsImplementationConfig:
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
+    qsa_indexer_implementation: Literal["eager", "npu_ascendc"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA top-k block selection implementation: 'eager' or 'npu_ascendc'. "
+            "'npu_ascendc' is the Ascend CANN Lightning Indexer (requires cann_ops_transformer, NPU)."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
         metadata={
